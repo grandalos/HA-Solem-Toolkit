@@ -3,10 +3,11 @@
   "name": "Solem Toolkit",
   "version": "1.0.2",
   "documentation": "https://github.com/hcraveiro/Home-Assistant-Solem-Toolkit",
-  "dependencies": [],
+  "dependencies": ["bluetooth"],
   "codeowners": ["@hcraveiro"],
   "requirements": [
         "dbus_fast>=2.33.0",
-        "bleak>=0.22.3"
+        "bleak>=0.22.3",
+        "bleak-retry-connector>=4.6.0"
     ]
 }

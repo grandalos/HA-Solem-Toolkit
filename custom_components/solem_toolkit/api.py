@@ -18,11 +18,12 @@ from bleak_retry_connector import (
     BleakOutOfConnectionSlotsError,
     establish_connection,
 )
+from homeassistant.components import bluetooth
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from homeassistant.core import HomeAssistant
 
-from .const import CHARACTERISTIC_UUID, DEFAULT_BLUETOOTH_TIMEOUT
+from .const import CHARACTERISTIC_UUID, CHARACTERISTIC_UUIDS, DEFAULT_BLUETOOTH_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,28 +46,72 @@ class SolemAPI:
         self.bluetooth_timeout = bluetooth_timeout
 
         self.characteristic_uuid: str = CHARACTERISTIC_UUID
+        self._resolved_characteristic_uuid: str | None = None
         self._conn_lock = asyncio.Lock()
 
     async def scan_bluetooth(self) -> list[BLEDevice]:
         """Return a list of discovered BLE devices."""
-        return await BleakScanner.discover(timeout=5.0)
+        service_infos = bluetooth.async_discovered_service_info(self.hass, connectable=True)
+        return [service_info.device for service_info in service_infos]
 
     async def _resolve_ble_device(self) -> BLEDevice:
         """Resolve a BLEDevice for the configured MAC address."""
-        # First attempt: direct lookup by address (fast-path on most platforms)
-        ble_device: Optional[BLEDevice] = await BleakScanner.find_device_by_address(
-            self.mac_address, timeout=5.0
+        # Use Home Assistant's bluetooth manager first so ESPHome bluetooth
+        # proxies and other remote adapters can provide the connection.
+        ble_device: Optional[BLEDevice] = bluetooth.async_ble_device_from_address(
+            self.hass, self.mac_address, connectable=True
         )
         if ble_device is not None:
             return ble_device
 
-        # Fallback: full scan and manual match (some platforms/proxies behave like this)
+        try:
+            service_info = await bluetooth.async_process_advertisements(
+                self.hass,
+                lambda info: (info.address or "").lower() == self.mac_address.lower(),
+                {"address": self.mac_address, "connectable": True},
+                bluetooth.BluetoothScanningMode.ACTIVE,
+                5.0,
+            )
+            if service_info is not None:
+                return service_info.device
+        except TimeoutError:
+            pass
+
+        # Last-resort direct scan for non-HA test contexts.
         devices = await BleakScanner.discover(timeout=5.0)
         for d in devices:
             if (d.address or "").lower() == self.mac_address.lower():
                 return d
 
         raise APIConnectionError("Device not found! Failed connecting!")
+
+    @staticmethod
+    def _client_has_characteristic(client: BleakClient, uuid: str) -> bool:
+        services = getattr(client, "services", None)
+        if services is None:
+            return False
+
+        for service in services:
+            for characteristic in service.characteristics:
+                if str(characteristic.uuid).lower() == uuid.lower():
+                    return True
+
+        return False
+
+    def _resolve_write_characteristic_uuid(self, client: BleakClient) -> str:
+        """Return the write characteristic exposed by BL-IP or LR-IP."""
+        if self._resolved_characteristic_uuid:
+            return self._resolved_characteristic_uuid
+
+        for uuid in CHARACTERISTIC_UUIDS:
+            if self._client_has_characteristic(client, uuid):
+                self._resolved_characteristic_uuid = uuid
+                _LOGGER.debug("Using Solem write characteristic %s", uuid)
+                return uuid
+
+        # Keep the configured default so older HA wrappers without service detail
+        # still try LR-IP first; users can inspect services via list_characteristics.
+        return self.characteristic_uuid
 
     async def _connect_client(self) -> BleakClient:
         """Establish a robust connection using bleak-retry-connector."""
@@ -133,7 +178,9 @@ class SolemAPI:
         if not client.is_connected:
             raise APIConnectionError("Client not connected")
 
-        await client.write_gatt_char(self.characteristic_uuid, payload, response=False)
+        characteristic_uuid = self._resolve_write_characteristic_uuid(client)
+        _LOGGER.debug("Writing Solem BLE payload to %s: %s", characteristic_uuid, payload.hex())
+        await client.write_gatt_char(characteristic_uuid, payload, response=False)
 
     async def _write_and_commit(self, command: bytes) -> None:
         """Write a command then commit it (Solem protocol)."""
@@ -153,7 +200,7 @@ class SolemAPI:
 
     async def turn_on(self) -> None:
         """Turn on controller (enable watering)."""
-        command = struct.pack(">HBBBH", 0x3105, 0x12, 0xFF, 0x00, 0xFFFF)
+        command = struct.pack(">HBBBH", 0x3105, 0xA0, 0x00, 0x00, 0x0000)
         await self._write_and_commit(command)
 
     async def turn_off_permanent(self) -> None:
@@ -163,30 +210,30 @@ class SolemAPI:
 
     async def turn_off_x_days(self, days: int) -> None:
         """Disable watering for X days."""
-        days = max(0, min(days, 365))
-        command = struct.pack(">HBBBH", 0x3105, 0x15, 0x00, days, 0xFFFF)
+        days = max(0, min(days, 15))
+        command = struct.pack(">HBBBH", 0x3105, 0xC0, 0x00, days, 0x0000)
         await self._write_and_commit(command)
 
     async def sprinkle_station_x_for_y_minutes(self, station: int, minutes: int) -> None:
         """Manually water a station for Y minutes."""
         station = max(1, min(station, 16))
-        minutes = max(1, min(minutes, 240))
-        command = struct.pack(">HBBBBH", 0x3105, 0x22, station, 0x00, minutes, 0xFFFF)
+        seconds = max(1, min(minutes, 720)) * 60
+        command = struct.pack(">HBBBH", 0x3105, 0x12, station, 0x00, seconds)
         await self._write_and_commit(command)
 
     async def sprinkle_all_stations_for_y_minutes(self, minutes: int) -> None:
         """Manually water all stations for Y minutes each."""
-        minutes = max(1, min(minutes, 240))
-        command = struct.pack(">HBBBH", 0x3105, 0x23, 0x00, minutes, 0xFFFF)
+        seconds = max(1, min(minutes, 720)) * 60
+        command = struct.pack(">HBBBH", 0x3105, 0x11, 0x00, 0x00, seconds)
         await self._write_and_commit(command)
 
     async def run_program_x(self, program: int) -> None:
         """Run a controller program by id (1-3 on most devices)."""
         program = max(1, min(program, 3))
-        command = struct.pack(">HBBBH", 0x3105, 0x21, program, 0x00, 0xFFFF)
+        command = struct.pack(">HBBBH", 0x3105, 0x14, 0x00, program, 0x0000)
         await self._write_and_commit(command)
 
     async def stop_manual_sprinkle(self) -> None:
         """Stop any running manual watering session."""
-        command = struct.pack(">HBBBH", 0x3105, 0x24, 0x00, 0x00, 0xFFFF)
+        command = struct.pack(">HBBBH", 0x3105, 0x15, 0x00, 0xFF, 0x0000)
         await self._write_and_commit(command)

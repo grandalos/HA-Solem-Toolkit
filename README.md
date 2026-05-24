@@ -3,7 +3,16 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-41BDF5.svg)](https://github.com/hacs/integration)
 [![GitHub release](https://img.shields.io/github/release/hcraveiro/Home-Assistant-Solem-Toolkit.svg)](https://github.com/hcraveiro/Home-Assistant-Solem-Toolkit/releases/)
 
-Integrate Solem Watering Bluetooth Controllers (only tested in BL-IP) into your Home Assistant. This Integration is meant to only provide services for Home Assistant to control irrigation using your BL-IP controller. 
+Integrate Solem Watering Bluetooth Controllers into your Home Assistant. This Integration is meant to only provide services for Home Assistant to control irrigation using your Solem controller.
+
+Tested protocol notes:
+
+- BL-IP write characteristic: `108b0002-eab5-bc09-d0ea-0b8f467ce8ee`
+- LR-IP write characteristic: `121f0002-af51-43db-939e-b3b5c9033447`
+
+The manual command payloads are shared by BL-IP and LR-IP. The integration uses
+Home Assistant's Bluetooth manager, so ESPHome Bluetooth Proxy connections can be
+used when the controller is visible through a connectable proxy.
 
 - [Home Assistant Solem Toolkit Integration](#home-assistant-solem-toolkit-integration)
     - [Installation](#installation)
