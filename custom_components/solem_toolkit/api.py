@@ -248,7 +248,23 @@ class SolemAPI:
 
             frames.append(frame)
 
-        latest_manual = next(
+        active_manual = next(
+            (
+                frame
+                for frame in frames
+                if frame.get("manual_active") is True
+            ),
+            None,
+        )
+        primary_manual = next(
+            (
+                frame
+                for frame in frames
+                if "manual_active" in frame and frame.get("sequence") == 2
+            ),
+            None,
+        )
+        latest_manual = active_manual or primary_manual or next(
             (
                 frame
                 for frame in reversed(frames)
