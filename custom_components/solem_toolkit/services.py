@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 
 from .api import APIConnectionError, SolemAPI
@@ -32,6 +32,18 @@ async def async_list_characteristics(hass: HomeAssistant, call: ServiceCall) -> 
             _LOGGER.info("Service: %s", svc_uuid)
             for c in chars:
                 _LOGGER.info("  Characteristic: %s (properties=%s)", c["uuid"], c["properties"])
+    except APIConnectionError as exc:
+        raise HomeAssistantError(str(exc)) from exc
+
+
+async def async_get_status(hass: HomeAssistant, call: ServiceCall) -> dict:
+    device_mac = call.data.get("device_mac")
+    wait_seconds = float(call.data.get("wait_seconds", 2.0))
+    api = SolemAPI(hass, device_mac, bluetooth_timeout=_get_timeout(call))
+    try:
+        result = await api.get_status(wait_seconds=wait_seconds)
+        _LOGGER.info("Solem status response: %s", result)
+        return result
     except APIConnectionError as exc:
         raise HomeAssistantError(str(exc)) from exc
 
@@ -108,6 +120,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async def _handle_list_characteristics(call: ServiceCall) -> None:
         await async_list_characteristics(hass, call)
 
+    async def _handle_get_status(call: ServiceCall) -> dict:
+        return await async_get_status(hass, call)
+
     async def _handle_turn_off_permanent(call: ServiceCall) -> None:
         await async_turn_off_permanent(hass, call)
 
@@ -130,6 +145,12 @@ def async_setup_services(hass: HomeAssistant) -> None:
         await async_stop_manual_sprinkle(hass, call)
 
     hass.services.async_register(DOMAIN, "list_characteristics", _handle_list_characteristics)
+    hass.services.async_register(
+        DOMAIN,
+        "get_status",
+        _handle_get_status,
+        supports_response=SupportsResponse.ONLY,
+    )
     hass.services.async_register(DOMAIN, "turn_off_permanent", _handle_turn_off_permanent)
     hass.services.async_register(DOMAIN, "turn_off_x_days", _handle_turn_off_x_days)
     hass.services.async_register(DOMAIN, "turn_on", _handle_turn_on)

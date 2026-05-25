@@ -23,7 +23,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from homeassistant.core import HomeAssistant
 
-from .const import CHARACTERISTIC_UUID, CHARACTERISTIC_UUIDS, DEFAULT_BLUETOOTH_TIMEOUT
+from .const import (
+    CHARACTERISTIC_UUID,
+    CHARACTERISTIC_UUIDS,
+    DEFAULT_BLUETOOTH_TIMEOUT,
+    NOTIFY_CHARACTERISTIC_UUID,
+    NOTIFY_CHARACTERISTIC_UUIDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +52,9 @@ class SolemAPI:
         self.bluetooth_timeout = bluetooth_timeout
 
         self.characteristic_uuid: str = CHARACTERISTIC_UUID
+        self.notify_characteristic_uuid: str = NOTIFY_CHARACTERISTIC_UUID
         self._resolved_characteristic_uuid: str | None = None
+        self._resolved_notify_characteristic_uuid: str | None = None
         self._conn_lock = asyncio.Lock()
 
     async def scan_bluetooth(self) -> list[BLEDevice]:
@@ -112,6 +120,19 @@ class SolemAPI:
         # Keep the configured default so older HA wrappers without service detail
         # still try LR-IP first; users can inspect services via list_characteristics.
         return self.characteristic_uuid
+
+    def _resolve_notify_characteristic_uuid(self, client: BleakClient) -> str:
+        """Return the notify characteristic exposed by BL-IP or LR-IP."""
+        if self._resolved_notify_characteristic_uuid:
+            return self._resolved_notify_characteristic_uuid
+
+        for uuid in NOTIFY_CHARACTERISTIC_UUIDS:
+            if self._client_has_characteristic(client, uuid):
+                self._resolved_notify_characteristic_uuid = uuid
+                _LOGGER.debug("Using Solem notify characteristic %s", uuid)
+                return uuid
+
+        return self.notify_characteristic_uuid
 
     async def _connect_client(self) -> BleakClient:
         """Establish a robust connection using bleak-retry-connector."""
@@ -192,6 +213,92 @@ class SolemAPI:
             # Commit frame
             commit = struct.pack(">BB", 0x3B, 0x00)
             await self._write_with_auth_retry(client, commit)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+    @staticmethod
+    def _parse_status_notifications(notifications: list[bytes]) -> dict:
+        """Best-effort parser for status frames observed on LR-IP notifications."""
+        frames: list[dict] = []
+        manual_frames: list[bytes] = []
+
+        for data in notifications:
+            frame = {"hex": data.hex(), "length": len(data)}
+            if len(data) >= 3:
+                frame["opcode"] = f"0x{data[0]:02x}"
+                frame["payload_length"] = data[1]
+                frame["sequence"] = data[2]
+
+            # Frames 0x32 and 0x3c carry the manual watering status in captures.
+            if len(data) >= 15 and data[0] in (0x32, 0x3C):
+                remaining_seconds = int.from_bytes(data[13:15], "big")
+                station_marker = data[3] & 0x0F
+                manual_active = bool(data[9]) or remaining_seconds > 0
+                frame.update(
+                    {
+                        "manual_active": manual_active,
+                        "active_station": station_marker or None,
+                        "remaining_seconds": remaining_seconds,
+                    }
+                )
+                manual_frames.append(data)
+
+            frames.append(frame)
+
+        latest_manual = next(
+            (
+                frame
+                for frame in reversed(frames)
+                if "manual_active" in frame
+            ),
+            None,
+        )
+
+        result = {
+            "raw_notifications": [data.hex() for data in notifications],
+            "frames": frames,
+            "manual_active": None,
+            "active_station": None,
+            "remaining_seconds": None,
+            "parser": "lrip_manual_status_v1",
+        }
+        if latest_manual:
+            result.update(
+                {
+                    "manual_active": latest_manual["manual_active"],
+                    "active_station": latest_manual["active_station"],
+                    "remaining_seconds": latest_manual["remaining_seconds"],
+                }
+            )
+
+        return result
+
+    async def get_status(self, wait_seconds: float = 2.0) -> dict:
+        """Query controller status and return raw notifications plus parsed hints."""
+        notifications: list[bytes] = []
+
+        def _notification_handler(_sender: int, data: bytearray) -> None:
+            payload = bytes(data)
+            notifications.append(payload)
+            _LOGGER.debug("Solem BLE notification: %s", payload.hex())
+
+        client = await self._connect_client()
+        try:
+            if not client.is_connected:
+                raise APIConnectionError("Failed connecting!")
+
+            notify_uuid = self._resolve_notify_characteristic_uuid(client)
+            await client.start_notify(notify_uuid, _notification_handler)
+            try:
+                await self._write_with_auth_retry(client, struct.pack(">BB", 0x3B, 0x00))
+                await asyncio.sleep(max(0.25, min(wait_seconds, 10.0)))
+            finally:
+                await client.stop_notify(notify_uuid)
+
+            return self._parse_status_notifications(notifications)
         finally:
             try:
                 await client.disconnect()

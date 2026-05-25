@@ -5,6 +5,16 @@ list_characteristics:
       description: "Device's MAC address"
       example: "00:11:22:33:44:55"
 
+get_status:
+  description: "Query controller status and return raw BLE notifications plus parsed manual watering hints"
+  fields:
+    device_mac:
+      description: "Device's MAC address"
+      example: "00:11:22:33:44:55"
+    wait_seconds:
+      description: "Seconds to wait for BLE notifications"
+      example: "2"
+
 turn_off_permanent:
   description: "Turn off the sprinkler permanently"
   fields:
