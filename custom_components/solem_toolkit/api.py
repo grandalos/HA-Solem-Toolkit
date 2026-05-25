@@ -257,22 +257,34 @@ class SolemAPI:
                 return None
             return int.from_bytes(data[offset : offset + 2], "big")
 
+        # Status frames use station-specific two-byte slots. Observed layout:
+        # station 1: sequence 2, bytes 13..14
+        # station 2: sequence 2, bytes 16..17
+        # station 3: sequence 1, bytes 4..5
+        # station 4: sequence 1, bytes 7..8
+        slots = {
+            1: (2, 13),
+            2: (2, 16),
+            3: (1, 4),
+            4: (1, 7),
+        }
+
         def _remaining_seconds_for_station(station: int | None) -> int | None:
-            # Status frames use station-specific two-byte slots. Observed layout:
-            # station 1: sequence 2, bytes 13..14
-            # station 2: sequence 2, bytes 16..17
-            # station 3: sequence 1, bytes 4..5
-            # station 4: sequence 1, bytes 7..8
-            slots = {
-                1: (2, 13),
-                2: (2, 16),
-                3: (1, 4),
-                4: (1, 7),
-            }
             if station not in slots:
                 return None
             sequence, offset = slots[station]
             return _slot_u16(sequence, offset)
+
+        active_stations = []
+        for station in sorted(slots):
+            remaining_seconds = _remaining_seconds_for_station(station)
+            if remaining_seconds:
+                active_stations.append(
+                    {
+                        "station": station,
+                        "remaining_seconds": remaining_seconds,
+                    }
+                )
 
         active_manual = next(
             (
@@ -304,18 +316,30 @@ class SolemAPI:
             "frames": frames,
             "manual_active": None,
             "active_station": None,
+            "active_stations": active_stations,
             "remaining_seconds": None,
             "parser": "lrip_manual_status_v1",
         }
         if latest_manual:
             remaining_seconds = _remaining_seconds_for_station(latest_manual["active_station"])
+            if remaining_seconds is None and active_stations:
+                remaining_seconds = active_stations[0]["remaining_seconds"]
+                latest_manual["active_station"] = active_stations[0]["station"]
             if remaining_seconds is not None:
                 latest_manual["remaining_seconds"] = remaining_seconds
             result.update(
                 {
-                    "manual_active": latest_manual["manual_active"],
+                    "manual_active": latest_manual["manual_active"] or bool(active_stations),
                     "active_station": latest_manual["active_station"],
                     "remaining_seconds": latest_manual["remaining_seconds"],
+                }
+            )
+        elif active_stations:
+            result.update(
+                {
+                    "manual_active": True,
+                    "active_station": active_stations[0]["station"],
+                    "remaining_seconds": active_stations[0]["remaining_seconds"],
                 }
             )
 
