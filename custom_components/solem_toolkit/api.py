@@ -223,7 +223,7 @@ class SolemAPI:
     def _parse_status_notifications(notifications: list[bytes]) -> dict:
         """Best-effort parser for status frames observed on LR-IP notifications."""
         frames: list[dict] = []
-        manual_frames: list[bytes] = []
+        data_by_sequence: dict[int, bytes] = {}
 
         for data in notifications:
             frame = {"hex": data.hex(), "length": len(data)}
@@ -231,22 +231,48 @@ class SolemAPI:
                 frame["opcode"] = f"0x{data[0]:02x}"
                 frame["payload_length"] = data[1]
                 frame["sequence"] = data[2]
+                data_by_sequence[data[2]] = data
 
             # Frames 0x32 and 0x3c carry the manual watering status in captures.
             if len(data) >= 15 and data[0] in (0x32, 0x3C):
-                remaining_seconds = int.from_bytes(data[13:15], "big")
-                station_marker = data[3] & 0x0F
-                manual_active = bool(data[9]) or remaining_seconds > 0
+                mode = data[3]
+                active_station = None
+                if mode == 0x42 and data[9] > 0:
+                    active_station = data[9]
+                manual_active = mode in (0x41, 0x42) and data[9] > 0
                 frame.update(
                     {
+                        "manual_mode": f"0x{mode:02x}",
                         "manual_active": manual_active,
-                        "active_station": station_marker or None,
-                        "remaining_seconds": remaining_seconds,
+                        "active_station": active_station,
+                        "remaining_seconds": None,
                     }
                 )
-                manual_frames.append(data)
 
             frames.append(frame)
+
+        def _slot_u16(sequence: int, offset: int) -> int | None:
+            data = data_by_sequence.get(sequence)
+            if data is None or len(data) < offset + 2:
+                return None
+            return int.from_bytes(data[offset : offset + 2], "big")
+
+        def _remaining_seconds_for_station(station: int | None) -> int | None:
+            # Status frames use station-specific two-byte slots. Observed layout:
+            # station 1: sequence 2, bytes 13..14
+            # station 2: sequence 2, bytes 16..17
+            # station 3: sequence 1, bytes 4..5
+            # station 4: sequence 1, bytes 7..8
+            slots = {
+                1: (2, 13),
+                2: (2, 16),
+                3: (1, 4),
+                4: (1, 7),
+            }
+            if station not in slots:
+                return None
+            sequence, offset = slots[station]
+            return _slot_u16(sequence, offset)
 
         active_manual = next(
             (
@@ -282,6 +308,9 @@ class SolemAPI:
             "parser": "lrip_manual_status_v1",
         }
         if latest_manual:
+            remaining_seconds = _remaining_seconds_for_station(latest_manual["active_station"])
+            if remaining_seconds is not None:
+                latest_manual["remaining_seconds"] = remaining_seconds
             result.update(
                 {
                     "manual_active": latest_manual["manual_active"],
